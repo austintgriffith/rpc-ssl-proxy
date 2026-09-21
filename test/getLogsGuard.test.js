@@ -1,55 +1,36 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { checkGetLogsParams } from '../utils/getLogsGuard.js';
+import { checkGetLogsParams as check } from '../utils/getLogsGuard.js';
 
-const hex = n => '0x' + n.toString(16);
-
-test('rejects a missing or non-object filter', () => {
-  assert.equal(checkGetLogsParams([], 100, 2000).ok, false);
-  assert.equal(checkGetLogsParams(['x'], 100, 2000).ok, false);
-  assert.equal(checkGetLogsParams(undefined, 100, 2000).ok, false);
+test('checks exact inclusive explicit range, including huge integers', () => {
+  assert.deepEqual(check([{ fromBlock: '0x1', toBlock: '0x7d0' }]), { ok: true, range: 2000 });
+  assert.equal(check([{ fromBlock: '0x1', toBlock: '0x7d1' }]).ok, false);
+  assert.equal(check([{ fromBlock: '0x2', toBlock: '0x1' }]).ok, false);
+  assert.equal(check([{ fromBlock: '0x20000000000001', toBlock: '0x20000000000001' }]).range, 1);
 });
 
-test('blockHash filters are always a single block', () => {
-  const r = checkGetLogsParams([{ blockHash: '0xabc' }], null, 2000);
-  assert.deepEqual(r, { ok: true, range: 1 });
+test('never guesses tag values or accepts noncanonical quantities', () => {
+  for (const block of [undefined, null, 'latest', 'pending', 'safe', 'finalized', 'earliest', '1', 1, '0x01', '0x', '0x' + 'f'.repeat(1000)]) {
+    assert.equal(check([{ fromBlock: block, toBlock: '0x20' }]).ok, false);
+    assert.equal(check([{ fromBlock: '0x1', toBlock: block }]).ok, false);
+  }
+  for (const params of [undefined, [], [null], [[]], [{}], [{}, {}]]) assert.equal(check(params).ok, false);
 });
 
-test('explicit hex range within the cap passes', () => {
-  const r = checkGetLogsParams([{ fromBlock: hex(1000), toBlock: hex(2999) }], null, 2000);
-  assert.deepEqual(r, { ok: true, range: 2000 });
+test('block hash cannot bypass range validation', () => {
+  const blockHash = '0x' + 'ab'.repeat(32);
+  assert.deepEqual(check([{ blockHash }]), { ok: true, range: 1 });
+  for (const filter of [{ blockHash: 'garbage' }, { blockHash: null },
+    { blockHash, fromBlock: '0x0', toBlock: '0xffffff' }, { blockHash, toBlock: null }]) {
+    assert.equal(check([filter]).ok, false);
+  }
 });
 
-test('explicit hex range one over the cap is refused', () => {
-  const r = checkGetLogsParams([{ fromBlock: hex(1000), toBlock: hex(3000) }], null, 2000);
-  assert.equal(r.ok, false);
-  assert.match(r.message, /2001 exceeds the maximum of 2000/);
-});
-
-test('fromBlock after toBlock is refused', () => {
-  assert.equal(checkGetLogsParams([{ fromBlock: hex(10), toBlock: hex(5) }], null, 2000).ok, false);
-});
-
-test('tags resolve against the cached head', () => {
-  assert.equal(checkGetLogsParams([{ fromBlock: hex(9000), toBlock: 'latest' }], 10000, 2000).ok, true);
-  assert.equal(checkGetLogsParams([{ fromBlock: hex(7000), toBlock: 'latest' }], 10000, 2000).ok, false);
-  assert.equal(checkGetLogsParams([{}], 10000, 2000).ok, true); // latest..latest
-  assert.equal(checkGetLogsParams([{ fromBlock: 'finalized', toBlock: 'pending' }], 10000, 2000).ok, true);
-});
-
-test('earliest is block 0 and gets refused on a real chain', () => {
-  const r = checkGetLogsParams([{ fromBlock: 'earliest', toBlock: hex(5000) }], null, 2000);
-  assert.equal(r.ok, false);
-});
-
-test('a tag with no cached head asks for explicit numbers', () => {
-  const r = checkGetLogsParams([{ fromBlock: hex(1), toBlock: 'latest' }], null, 2000);
-  assert.equal(r.ok, false);
-  assert.match(r.message, /explicit hex block number/);
-});
-
-test('garbage block values are refused', () => {
-  assert.equal(checkGetLogsParams([{ fromBlock: 'nope' }], 10, 2000).ok, false);
-  assert.equal(checkGetLogsParams([{ fromBlock: -1 }], 10, 2000).ok, false);
-  assert.equal(checkGetLogsParams([{ fromBlock: {} }], 10, 2000).ok, false);
+test('address/topic filters are validated and bounded', () => {
+  const filter = { fromBlock: '0x1', toBlock: '0x2' };
+  const address = '0x' + 'ab'.repeat(20), topic = '0x' + 'cd'.repeat(32);
+  assert.equal(check([{ ...filter, address: [address], topics: [null, [topic]] }]).ok, true);
+  for (const extra of [{ address: [] }, { address: 'bad' }, { address: Array(21).fill(address) },
+    { topics: Array(5).fill(null) }, { topics: [[...Array(21).fill(topic)]] },
+    { topics: ['bad'] }, { unknown: 1 }]) assert.equal(check([{ ...filter, ...extra }]).ok, false);
 });

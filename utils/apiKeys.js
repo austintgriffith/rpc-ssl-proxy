@@ -1,152 +1,73 @@
-/**
- * API key store.
- *
- * Keys are minted by rpc-token-manager into the Firestore collection
- * `rpcKeys<FIREBASE_COLLECTION>` (doc id = key, fields: keyValue,
- * ethereumAddress, createdAt). This module mirrors that collection into
- * memory on an interval so the request path never touches Firestore.
- *
- * A key is valid when its doc exists and does not carry `revoked: true`.
- * Deleting the doc (what the token manager's delete route does) revokes it.
- */
+import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 
-import { apiKeyRefreshInterval } from '../config.js';
+export const hashApiKey = key => createHash('sha256').update(key).digest('hex');
+const HEX = /^[a-f0-9]{64}$/;
 
-const KEY_PATTERN = /^[a-f0-9]{16,64}$/i;
-
-const state = {
-  keys: new Map(),        // key -> { owner, createdAt }
-  ready: false,           // true once one load has succeeded
-  lastRefresh: null,
-  lastError: null,
-  refreshErrors: 0,
-  timer: null,
-};
-
-/** Replace the whole key set (used by the poller and by tests). */
-function setApiKeys(entries) {
-  const next = new Map();
+// Only an operator-managed local file is trusted. The public token manager's
+// Firestore collection is deliberately not an authority for privileged access.
+export function parseKeyRegistry(raw) {
+  const entries = JSON.parse(raw);
+  if (!Array.isArray(entries)) throw new Error('Key registry must be an array');
+  const keys = new Map();
   for (const entry of entries) {
-    if (!entry || typeof entry.key !== 'string') continue;
-    const key = entry.key.trim().toLowerCase();
-    if (!KEY_PATTERN.test(key)) continue;
-    if (entry.revoked === true) continue;
-    next.set(key, { owner: entry.owner || null, createdAt: entry.createdAt || null });
-  }
-  state.keys = next;
-  state.ready = true;
-  state.lastRefresh = new Date();
-}
-
-function isApiKeyStoreReady() {
-  return state.ready;
-}
-
-/** Well-formed key string or null. Never throws. */
-function normalizeApiKey(raw) {
-  if (typeof raw !== 'string') return null;
-  const key = raw.trim().toLowerCase();
-  return KEY_PATTERN.test(key) ? key : null;
-}
-
-/** Pull the key from the URL (`/v1/<key>`) or the `X-Api-Key` header. */
-function extractApiKey(req) {
-  try {
-    const fromPath = req?.params?.key;
-    if (typeof fromPath === 'string' && fromPath.length > 0) return fromPath;
-    const fromHeader = req?.headers?.['x-api-key'];
-    if (typeof fromHeader === 'string' && fromHeader.length > 0) return fromHeader;
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Resolve the key on a request.
- *   { status: 'none' }                       no key presented
- *   { status: 'invalid', reason }            key presented but not accepted
- *   { status: 'valid', key, owner }          key accepted
- */
-function resolveApiKey(req) {
-  const raw = extractApiKey(req);
-  if (raw === null) return { status: 'none' };
-  const key = normalizeApiKey(raw);
-  if (key === null) return { status: 'invalid', reason: 'malformed key' };
-  if (!state.ready) return { status: 'invalid', reason: 'key store not loaded' };
-  const entry = state.keys.get(key);
-  if (!entry) return { status: 'invalid', reason: 'unknown or revoked key' };
-  return { status: 'valid', key, owner: entry.owner };
-}
-
-/** Load keys from Firestore once. Exported so a script can run it by hand. */
-async function loadApiKeysFromFirestore() {
-  const { db } = await import('./firebaseClient.js');
-  const collectionName = `rpcKeys${process.env.FIREBASE_COLLECTION || ''}`;
-  const snapshot = await db.collection(collectionName).get();
-  const entries = [];
-  snapshot.forEach(doc => {
-    const data = doc.data() || {};
-    entries.push({
-      key: data.keyValue || doc.id,
-      owner: data.ethereumAddress || null,
-      createdAt: data.createdAt || null,
-      revoked: data.revoked === true,
-    });
-  });
-  setApiKeys(entries);
-  return entries.length;
-}
-
-/**
- * Start mirroring Firestore into memory. A failed refresh keeps the last
- * good set; if no load has ever succeeded, every key is treated as invalid.
- */
-function startApiKeyPolling(intervalSeconds = apiKeyRefreshInterval) {
-  if (state.timer) return;
-  const tick = async () => {
-    try {
-      const n = await loadApiKeysFromFirestore();
-      if (state.refreshErrors > 0) console.log(`🔑 API key refresh recovered (${n} keys)`);
-      state.refreshErrors = 0;
-      state.lastError = null;
-    } catch (error) {
-      state.refreshErrors++;
-      state.lastError = error.message;
-      console.error(`❌ API key refresh failed (${state.refreshErrors}): ${error.message}`);
-      if (!state.ready) console.error('   No key set loaded yet - all API keys are being rejected');
+    if (!entry || typeof entry.digest !== 'string' || !HEX.test(entry.digest) || typeof entry.owner !== 'string' ||
+        !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(entry.owner) || keys.has(entry.digest)) {
+      throw new Error('Invalid or duplicate key registry entry');
     }
-  };
-  tick();
-  state.timer = setInterval(tick, intervalSeconds * 1000);
-  state.timer.unref?.();
-  console.log(`🔑 API key store polling Firestore every ${intervalSeconds}s`);
+    keys.set(entry.digest, { owner: entry.owner });
+  }
+  return keys;
 }
 
-function stopApiKeyPolling() {
-  if (state.timer) clearInterval(state.timer);
-  state.timer = null;
-}
-
-/** For /status. Counts only, never the keys themselves. */
-function getApiKeyStoreStatus() {
+export function createApiKeyStore({ file, now = Date.now, read = readFile,
+  maxAgeMs = 15000, refreshMs = 5000 } = {}) {
+  let keys = new Map();
+  let refreshedAt = null;
+  let timer;
+  let pending;
+  let failed = false;
+  async function refresh() {
+    if (pending) return pending;
+    pending = (async () => {
+      try {
+        if (!file) throw new Error('Key registry not configured');
+        const next = parseKeyRegistry(await read(file, 'utf8'));
+        keys = next;
+        refreshedAt = now();
+        failed = false;
+      } catch {
+        // Never preserve revoked credentials when refreshing fails.
+        keys = new Map();
+        refreshedAt = null;
+        failed = true;
+      }
+    })();
+    try { await pending; } finally { pending = undefined; }
+  }
+  function resolve(req) {
+    const path = req.params?.key;
+    const header = req.headers?.['x-api-key'];
+    if (path === undefined && header === undefined) return { status: 'none' };
+    if (path !== undefined && header !== undefined && path !== header) return { status: 'invalid' };
+    const raw = path ?? header;
+    if (typeof raw !== 'string' || !HEX.test(raw)) return { status: 'invalid' };
+    if (refreshedAt === null || now() - refreshedAt >= maxAgeMs || now() < refreshedAt) {
+      return { status: 'unavailable' };
+    }
+    const entry = keys.get(hashApiKey(raw));
+    return entry ? { status: 'valid', owner: entry.owner } : { status: 'invalid' };
+  }
   return {
-    ready: state.ready,
-    keyCount: state.keys.size,
-    lastRefresh: state.lastRefresh ? state.lastRefresh.toISOString() : null,
-    lastError: state.lastError,
-    refreshErrors: state.refreshErrors,
+    resolve, refresh,
+    async start() {
+      await refresh();
+      if (!timer) { timer = setInterval(refresh, refreshMs); timer.unref(); }
+    },
+    stop() { clearInterval(timer); timer = undefined; },
+    status() {
+      return { ready: refreshedAt !== null && now() >= refreshedAt && now() - refreshedAt < maxAgeMs,
+        keyCount: keys.size, refreshedAt, failed };
+    },
   };
 }
-
-export {
-  setApiKeys,
-  isApiKeyStoreReady,
-  normalizeApiKey,
-  extractApiKey,
-  resolveApiKey,
-  loadApiKeysFromFirestore,
-  startApiKeyPolling,
-  stopApiKeyPolling,
-  getApiKeyStoreStatus,
-};

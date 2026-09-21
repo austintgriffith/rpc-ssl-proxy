@@ -1,82 +1,118 @@
-# API keys and eth_getLogs
+# Trusted eth_getLogs access — local revision
 
-`eth_getLogs` is blocked for anonymous traffic. The IP/origin rate limiter cannot
-stop a caller who rotates IPs or invents origins, and heavy calls that time out
-were never even counted. See "Encountered RPC User Security Concerns" in the
-private `bg-rpc-overview` doc for the incident.
+This replaces the closed PR's Firestore signup integration. Only an operator can
+issue access, using a local JSON registry. Signing in with a wallet or minting a
+key in `rpc-token-manager` grants no access here. The nodes repository is unchanged.
 
-A request that carries a valid API key takes a different path:
+## Enable only after staging verification
 
-| | anonymous | with key |
-|---|---|---|
-| identity | IP or `Origin` header (free to fake) | key (revocable, tied to a wallet) |
-| `eth_getLogs` | refused (429, `-32005`) | allowed within bounds |
-| budget | IP/origin hourly + daily, counted after success | per-key rolling hour, **charged before forwarding** |
-| concurrent `eth_getLogs` | n/a | `getLogsMaxInFlightPerKey` (2) |
-| block range per `eth_getLogs` | n/a | `getLogsMaxBlockRange` (2000) |
+Log access defaults to **off**. This implementation supports **one proxy process**.
+Owner/global counters are in memory and reset on restart. Do not use PM2 cluster
+mode, replicas, or rolling overlapping processes: they multiply the limits.
+A shared atomic limiter and persistent budgets are required before scaling out.
 
-## Using a key
+1. Use Node 20+ and install dependencies. Run `npm test`.
+2. Configure `RPC_KEYS_FILE` as an absolute path outside the repository, for example
+   `/etc/bg-rpc/rpc-keys.json`. Create its parent directory with appropriate ownership.
+   The proxy needs read access; restrict writes to the operator account. The file
+   contains an array of `{ "digest": "<sha256 hex>", "owner": "<stable owner slug>" }`.
+3. Issue a staging token using the CLI below.
+4. Verify the actual downstream path supports explicit-range `eth_getLogs`, has
+   execution deadlines, and cannot bypass this gateway from the public internet.
+   Confirm downstream pool/cache components do not retry logs into paid providers.
+   This gateway never invokes its own fallback for logs, but cannot control a
+   downstream service's fallback policy.
+5. Measure broad/dense and sparse log queries at the limits below, verify node
+   recovery after timeouts, and tune limits to actual capacity. Proxy timeouts
+   bound the gateway's wait, not necessarily a node's execution after disconnection.
+6. Set `RPC_GET_LOGS_ENABLED=true`, restart the single process, and verify approved,
+   unapproved, revoked, over-budget, and disconnected callers in staging.
 
-Put the key in the URL or a header. Both are equivalent.
+No staging deployment, live chain call, or capacity measurement was performed as
+part of this local revision. An operator must confirm these before enabling it.
+Existing TLS verification bypasses were removed: use valid upstream certificates
+or configure the correct CA (`NODE_EXTRA_CA_CERTS`) instead of disabling verification.
 
-```
-POST https://mainnet.rpc.buidlguidl.com/v1/<key>
-POST https://mainnet.rpc.buidlguidl.com/        with header  X-Api-Key: <key>
-```
+## Issue and revoke tokens
 
-Keys are 16+ hex characters. A malformed, unknown or revoked key gets `401`
-with a JSON-RPC error `-32001 Invalid API key`. It is not treated as anonymous.
+Set `RPC_KEYS_FILE` in the shell running these commands as well as the proxy's env.
+The CLI does not load `.env` automatically.
 
-## Where keys come from
-
-`rpc-token-manager` (sign in with a wallet, mint keys) writes to the Firestore
-collection `rpcKeys<FIREBASE_COLLECTION>`; doc id = key, fields `keyValue`,
-`ethereumAddress`, `createdAt`. Deleting the doc revokes the key. A doc with
-`revoked: true` is also treated as revoked.
-
-The proxy mirrors that collection into memory every `apiKeyRefreshInterval`
-seconds (60). The request path never reads Firestore. If the mirror has never
-loaded, every key is rejected and the log says so.
-
-Env: `FIREBASE_COLLECTION` (already used for the request ledger) and the
-Firebase credentials already in `.env.example`.
-
-## eth_getLogs bounds (keyed)
-
-- `fromBlock`..`toBlock` may span at most `getLogsMaxBlockRange` blocks.
-  `earliest` is block 0. `latest`/`pending`/`safe`/`finalized` resolve against
-  a chain head the proxy refreshes every 12 s with an `eth_blockNumber` call.
-  If no head is known yet, a tag is refused with a message asking for explicit
-  hex block numbers. `blockHash` filters are always one block.
-- A refused range returns HTTP 200 with JSON-RPC error `-32602` and a message
-  saying the limit.
-- At most `getLogsMaxInFlightPerKey` `eth_getLogs` per key at once. Over that
-  is `429` with `Retry-After: 1`.
-
-## Per-key budget
-
-Every request costs `methodRequestCounts[method]` units (default 1,
-`eth_getLogs` 100). The rolling-hour budget is `apiKeyRateLimitPerHour` (50000):
-500 `eth_getLogs`, or 50000 light calls, or a mix. Same rolling-window
-approximation as the IP/origin limiter. Over budget is `429` with the usual
-rate limit body. The budget lives in proxy memory, so a restart clears it.
-
-## Knobs
-
-All in `config.js`: `apiKeyRefreshInterval`, `apiKeyRateLimitPerHour`,
-`getLogsMaxBlockRange`, `getLogsMaxInFlightPerKey`, `apiKeySignupUrl` (shown
-in the anonymous refusal message).
-
-## Monitoring
-
-`GET /status` now includes `apiKeys` (mirror health, key count),
-`keyLimits` (top keys by usage, masked) and `latestBlock`.
-
-## Tests
-
-```
-yarn test        # node --test test/*.test.js
+```sh
+export RPC_KEYS_FILE=/etc/bg-rpc/rpc-keys.json
+node scripts/manage-keys.js issue spencer
+node scripts/manage-keys.js revoke-key spencer <digest-from-registry>
+node scripts/manage-keys.js revoke-owner spencer
 ```
 
-Unit tests cover key resolution, the per-key limiter, and the range guard.
-The Express wiring in `proxy.js` is not under test (it binds 443 on import).
+`issue` prints a random 256-bit token once. Give it privately to its owner and keep
+it server-side. Browser bundles and public RPC URLs expose tokens to other people.
+The registry stores only SHA-256 digests, not usable tokens. Reissuing with the
+**same owner** preserves that owner's existing usage allowance within the process.
+Only create a new owner for a genuinely separate approved person/project.
+
+Updates use a lock and atomic rename with mode 0600. A lock left after a crashed
+CLI requires the operator to confirm no update is running before removing it.
+Revocation prevents new requests after the next refresh (normally 5 seconds);
+in-flight work is not retroactively canceled. Failed reads clear access immediately;
+a stalled refresh denies access once the last successful snapshot is 15 seconds old.
+An empty array revokes all keys. Setting `RPC_GET_LOGS_ENABLED=false` and restarting
+disables log access entirely. Do not place the registry in Git or share it with the
+public signup service.
+
+## Requests
+
+Use `POST /` with `X-Api-Key: <token>`, or `POST /v1/<token>` for clients needing a
+URL. Prefer the header; redact token-bearing paths in any external access logs.
+Conflicting path/header tokens are rejected. Missing or invalid tokens never grant
+log access. Valid tokens do not exempt ordinary requests from existing IP limits.
+
+Each log filter must use explicit hex `fromBlock` and `toBlock`, or a valid 32-byte
+`blockHash` without either range field. Moving tags (`latest`, `safe`, `finalized`,
+`pending`) and omitted ranges are rejected. Fetch `eth_blockNumber` separately and
+paginate explicit ranges. This version deliberately does not guess tag heights.
+
+Single requests and mixed batches are supported. If any log filter is invalid or
+admission fails, the entire batch is rejected with one error per request ID; none
+is forwarded. The existing validator still rejects notifications (requests without
+IDs); this revision does not add notification support.
+
+## Starting limits
+
+| Control | Default |
+| --- | --- |
+| Inclusive block range | 2,000 |
+| Active log calls per owner, across all their tokens | 2 |
+| Active log calls across the single proxy process | 4 |
+| Weighted units per owner per approximate rolling hour | 50,000 |
+| Weighted units globally per approximate rolling hour | 100,000 |
+| Cost of each log call, including failed upstream work | 100 |
+| Maximum batch items | 20 |
+| Maximum addresses / alternatives per topic | 20 / 20 |
+| Upstream total deadline | 10 seconds |
+| Maximum upstream response bytes | 5 MiB |
+
+Hourly limits approximate a rolling window using two weighted hour buckets. They
+are not a substitute for concurrency controls or a durable billing quota. A small
+block range can still be expensive. No claim of production capacity is implied.
+
+Batches containing logs use the bounded primary-only path. Other items in such a
+batch are charged using `config.js` method weights. Ordinary batches use the legacy
+path. Disconnected clients retain their reservations until upstream completion or
+timeout. There are no gateway retries, no paid fallback, and no changes to the
+ordinary RPC circuit breaker from log traffic. Credential and caller identity
+headers are not forwarded to upstreams.
+
+`/status` and `/proxy` now require the existing admin key, since their old responses
+exposed upstream URLs. `/status` includes token registry health and active log
+reservations. Existing anonymous Origin bypasses and other anonymous limiter
+limitations are outside this change and still require separate work.
+
+## Verification
+
+`npm test` runs unit tests and real local HTTP integration tests against a fake
+upstream, using the same route registration, validator, access handler and Axios
+transport used by production. No Firebase, production database, live RPC, TLS
+listener on 443, or real token is needed. Tests cover issuing/revoking/rotating
+keys, stale registries, shared budgets, exact ranges, batches, disconnects,
+timeouts, response limits, and credential stripping.

@@ -36,3 +36,5 @@ requestReject.log
 
 # IP blacklist (may contain sensitive IPs)
 ip_blacklist.txt
+# Local trusted-token registry and CLI lock/temp files
+rpc-keys.json*

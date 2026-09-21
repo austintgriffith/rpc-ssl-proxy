@@ -1,44 +1,63 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { setApiKeys, resolveApiKey, normalizeApiKey, extractApiKey, getApiKeyStoreStatus } from '../utils/apiKeys.js';
+import { createApiKeyStore, hashApiKey, parseKeyRegistry } from '../utils/apiKeys.js';
 
-const KEY = 'ab'.repeat(8); // 16 hex, the shape rpc-token-manager mints (built at runtime so secret scanners stay quiet)
+const key = 'ab'.repeat(32);
+const request = { headers: { 'x-api-key': key } };
+const registry = JSON.stringify([{ digest: hashApiKey(key), owner: 'alice' }]);
 
-test('no key presented is the anonymous path', () => {
-  setApiKeys([{ key: KEY, owner: '0xabc' }]);
-  assert.deepEqual(resolveApiKey({ params: {}, headers: {} }), { status: 'none' });
+test('only operator registry digests authorize; public token-manager shape fails closed', async () => {
+  let raw = registry;
+  const store = createApiKeyStore({ file: 'mock', read: async () => raw });
+  assert.equal(store.resolve(request).status, 'unavailable');
+  await store.refresh();
+  assert.deepEqual(store.resolve(request), { status: 'valid', owner: 'alice' });
+  raw = JSON.stringify([{ keyValue: key, ethereumAddress: '0xabc' }]);
+  await store.refresh();
+  assert.equal(store.resolve(request).status, 'unavailable');
+  assert.equal(store.status().keyCount, 0);
 });
 
-test('key in URL path or header resolves to its owner', () => {
-  setApiKeys([{ key: KEY, owner: '0xabc' }]);
-  assert.deepEqual(resolveApiKey({ params: { key: KEY }, headers: {} }), { status: 'valid', key: KEY, owner: '0xabc' });
-  assert.deepEqual(resolveApiKey({ params: {}, headers: { 'x-api-key': KEY.toUpperCase() } }), { status: 'valid', key: KEY, owner: '0xabc' });
+test('revocation, failed refresh, staleness, and recovery', async () => {
+  let time = 0, raw = registry, fail = false;
+  const store = createApiKeyStore({ file: 'mock', now: () => time,
+    read: async () => { if (fail) throw new Error('unreadable'); return raw; } });
+  await store.refresh();
+  time = 15000;
+  assert.equal(store.resolve(request).status, 'unavailable');
+  await store.refresh();
+  assert.equal(store.resolve(request).status, 'valid');
+  raw = '[]'; await store.refresh();
+  assert.equal(store.resolve(request).status, 'invalid');
+  raw = registry; await store.refresh();
+  fail = true; await store.refresh();
+  assert.equal(store.resolve(request).status, 'unavailable');
+  fail = false; await store.refresh();
+  assert.equal(store.resolve(request).status, 'valid');
 });
 
-test('unknown, revoked and malformed keys are invalid, not anonymous', () => {
-  setApiKeys([{ key: KEY, owner: '0xabc' }, { key: 'ff'.repeat(8), owner: '0xdef', revoked: true }]);
-  assert.equal(resolveApiKey({ params: { key: 'ff'.repeat(8) }, headers: {} }).status, 'invalid');
-  assert.equal(resolveApiKey({ params: { key: '01'.repeat(8) }, headers: {} }).status, 'invalid');
-  assert.equal(resolveApiKey({ params: { key: 'not-a-key' }, headers: {} }).status, 'invalid');
-  assert.equal(resolveApiKey({ params: { key: '../etc' }, headers: {} }).status, 'invalid');
+test('missing, empty, malformed and conflicting credentials are distinct', async () => {
+  const store = createApiKeyStore({ file: 'mock', read: async () => registry });
+  await store.refresh();
+  assert.equal(store.resolve({ headers: {} }).status, 'none');
+  for (const value of ['', 'ab'.repeat(8), [key], key.toUpperCase()]) {
+    assert.equal(store.resolve({ headers: { 'x-api-key': value } }).status, 'invalid');
+  }
+  assert.equal(store.resolve({ params: { key }, headers: {} }).status, 'valid');
+  assert.equal(store.resolve({ params: { key }, headers: { 'x-api-key': 'cd'.repeat(32) } }).status, 'invalid');
+  assert.equal(JSON.stringify(store.status()).includes(key), false);
+  assert.throws(() => parseKeyRegistry(JSON.stringify([{ digest: hashApiKey(key), owner: '' }])));
 });
 
-test('path wins over header when both are present', () => {
-  setApiKeys([{ key: KEY, owner: '0xabc' }]);
-  assert.equal(extractApiKey({ params: { key: KEY }, headers: { 'x-api-key': 'ff'.repeat(8) } }), KEY);
-});
-
-test('normalizeApiKey only accepts hex of a sane length', () => {
-  assert.equal(normalizeApiKey(' ' + KEY.toUpperCase() + ' '), KEY);
-  assert.equal(normalizeApiKey('abc'), null);
-  assert.equal(normalizeApiKey('g'.repeat(16)), null);
-  assert.equal(normalizeApiKey(42), null);
-});
-
-test('status exposes counts only', () => {
-  setApiKeys([{ key: KEY, owner: '0xabc' }]);
-  const st = getApiKeyStoreStatus();
-  assert.equal(st.ready, true);
-  assert.equal(st.keyCount, 1);
-  assert.equal(JSON.stringify(st).includes(KEY), false);
+test('overlapping refreshes share one read and stale pending reads cannot authorize', async () => {
+  let resolveRead, time = 0, reads = 0;
+  const store = createApiKeyStore({ file: 'mock', now: () => time, read: () => {
+    reads++; return new Promise(resolve => { resolveRead = resolve; });
+  } });
+  const first = store.refresh(), second = store.refresh();
+  assert.equal(reads, 1); resolveRead(registry); await Promise.all([first, second]);
+  const pending = store.refresh(); time = 15000;
+  assert.equal(store.resolve(request).status, 'unavailable');
+  resolveRead('[]'); await pending;
+  assert.equal(store.resolve(request).status, 'invalid');
 });

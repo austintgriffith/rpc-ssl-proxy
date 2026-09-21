@@ -66,14 +66,14 @@ function sendErrorAndLog(req, res, code, message, id, logReason) {
   // Fire-and-forget logging - never awaited, never throws
   logRejectedRequest(req, logReason);
   
-  return res.status(200).send({
-    jsonrpc: "2.0",
-    id: id ?? null,
-    error: {
-      code,
-      message
-    }
+  const error = requestId => ({
+    jsonrpc: "2.0", id: requestId ?? null, error: { code, message }
   });
+  // Admission is all-or-nothing; return an error for every item in a nonempty
+  // batch so callers can correlate all IDs and do not wait for missing replies.
+  const payload = Array.isArray(req.body) && req.body.length
+    ? req.body.map(call => error(call?.id)) : error(id);
+  return res.status(200).send(payload);
 }
 
 /**
@@ -123,11 +123,11 @@ function validateRpcRequest(req, res, next) {
         const id = request?.id;
         
         // Basic structure validation
-        if (!jsonrpc || jsonrpc !== "2.0" || !method || id === undefined) {
+        if (!jsonrpc || jsonrpc !== "2.0" || typeof method !== 'string' || !method || id === undefined) {
           let reason = [];
           if (!jsonrpc) reason.push('jsonrpc missing');
           else if (jsonrpc !== "2.0") reason.push('jsonrpc must be "2.0"');
-          if (!method) reason.push('method missing');
+          if (typeof method !== 'string' || !method) reason.push('method must be a nonempty string');
           if (id === undefined) reason.push('id missing');
           
           const reasonStr = reason.join(", ");
@@ -169,11 +169,11 @@ function validateRpcRequest(req, res, next) {
     const id = req.body?.id;
     
     // Basic structure validation
-    if (!jsonrpc || jsonrpc !== "2.0" || !method || id === undefined) {
+    if (!jsonrpc || jsonrpc !== "2.0" || typeof method !== 'string' || !method || id === undefined) {
       let reason = [];
       if (!jsonrpc) reason.push('jsonrpc missing');
       else if (jsonrpc !== "2.0") reason.push('jsonrpc must be "2.0"');
-      if (!method) reason.push('method missing');
+      if (typeof method !== 'string' || !method) reason.push('method must be a nonempty string');
       if (id === undefined) reason.push('id missing');
       
       const reasonStr = reason.join(", ");
